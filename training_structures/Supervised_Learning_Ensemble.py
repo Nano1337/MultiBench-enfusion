@@ -67,25 +67,38 @@ class MMDL(nn.Module):
         return self.head(out)
 
 
-def deal_with_objective(objective, pred, truth, args):
+def deal_with_objective(objectives, preds, truth, args):
     """Alter inputs depending on objective function, to deal with different objective arguments."""
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    if type(objective) == nn.CrossEntropyLoss:
-        if len(truth.size()) == len(pred.size()):
-            truth1 = truth.squeeze(len(pred.size())-1)
-        else:
-            truth1 = truth
-        return objective(pred, truth1.long().to(device))
-    elif type(objective) == nn.MSELoss or type(objective) == nn.modules.loss.BCEWithLogitsLoss or type(objective) == nn.L1Loss:
-        return objective(pred, truth.float().to(device))
+    if type(objectives[0]) == nn.CrossEntropyLoss:
+        out = []
+        for i, pred in enumerate(preds): 
+            pred = torch.argmax(pred, dim=1).float()
+            out.append(objectives[i](pred, truth.float().to(device)))
+        return sum(out) / len(out)
+    elif type(objectives[0]) == nn.MSELoss or type(objectives[0]) == nn.modules.loss.BCEWithLogitsLoss or type(objectives[0]) == nn.L1Loss:
+        raise NotImplementedError
     else:
-        return objective(pred, truth, args)
+        raise NotImplementedError
 
+
+
+class EnsembleModel(nn.Module): 
+    def __init__(self, encoders, heads): 
+        super(EnsembleModel, self).__init__()
+        self.encoders = nn.ModuleList(encoders)
+        self.heads = nn.ModuleList(heads)
+
+    def forward(self, inputs):
+        outs = []
+        for i in range(len(inputs)):
+            outs.append(self.heads[i](self.encoders[i](inputs[i])))
+        return outs
 
 def train(
-        encoders, fusion, head, train_dataloader, valid_dataloader, total_epochs, additional_optimizing_modules=[], is_packed=False,
+        encoders, heads, train_dataloader, valid_dataloader, total_epochs, additional_optimizing_modules=[], is_packed=False,
         early_stop=False, task="classification", optimtype=torch.optim.RMSprop, lr=0.001, weight_decay=0.0,
-        objective=nn.CrossEntropyLoss(), auprc=False, save='best.pt', validtime=False, objective_args_dict=None, input_to_float=True, clip_val=8,
+        objectives=nn.CrossEntropyLoss(), auprc=False, save='best.pt', validtime=False, objective_args_dict=None, input_to_float=True, clip_val=8,
         track_complexity=True):
     """
     Handle running a simple supervised training loop.
@@ -111,7 +124,7 @@ def train(
     :param track_complexity: whether to track training complexity or not
     """
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model = MMDL(encoders, fusion, head, has_padding=is_packed).to(device)
+    model = EnsembleModel(encoders, heads).to(device)
 
     def _trainprocess():
         additional_params = []
@@ -143,23 +156,21 @@ def train(
                 if is_packed:
                     with torch.backends.cudnn.flags(enabled=False):
                         model.train()
-                        out = model([[_processinput(i).to(device)
+                        outs = model([[_processinput(i).to(device)
                                     for i in j[0]], j[1]])
 
                 else:
                     model.train()
-                    out = model([_processinput(i).to(device)
+                    outs = model([_processinput(i).to(device)
                                 for i in j[:-1]])
                 if not (objective_args_dict is None):
-                    objective_args_dict['reps'] = model.reps
-                    objective_args_dict['fused'] = model.fuseout
                     objective_args_dict['inputs'] = j[:-1]
                     objective_args_dict['training'] = True
                     objective_args_dict['model'] = model
                 loss = deal_with_objective(
-                    objective, out, j[-1], objective_args_dict)
+                    objectives, outs, j[-1], objective_args_dict)
                 if task == "classification":
-                        pred.append(torch.argmax(out, 1))
+                        pred.append(torch.argmax(torch.mean(torch.stack(outs, dim=2), dim=2), dim=1))
                 true.append(j[-1])
 
                 totalloss += loss * len(j[-1])
@@ -187,10 +198,10 @@ def train(
                 pts = []
                 for j in valid_dataloader:
                     if is_packed:
-                        out = model([[_processinput(i).to(device)
+                        outs = model([[_processinput(i).to(device)
                                     for i in j[0]], j[1]])
                     else:
-                        out = model([_processinput(i).to(device)
+                        outs = model([_processinput(i).to(device)
                                     for i in j[:-1]])
 
                     if not (objective_args_dict is None):
@@ -199,19 +210,14 @@ def train(
                         objective_args_dict['inputs'] = j[:-1]
                         objective_args_dict['training'] = False
                     loss = deal_with_objective(
-                        objective, out, j[-1], objective_args_dict)
+                        objectives, outs, j[-1], objective_args_dict)
                     totalloss += loss*len(j[-1])
                     
                     if task == "classification":
-                        pred.append(torch.argmax(out, 1))
+                        pred.append(torch.argmax(torch.mean(torch.stack(outs, dim=2), dim=2), dim=1))
                     elif task == "multilabel":
-                        pred.append(torch.sigmoid(out).round())
+                        raise NotImplementedError
                     true.append(j[-1])
-                    if auprc:
-                        # pdb.set_trace()
-                        sm = softmax(out)
-                        pts += [(sm[i][1].item(), j[-1][i].item())
-                                for i in range(j[-1].size(0))]
             if pred:
                 pred = torch.cat(pred, 0)
             true = torch.cat(true, 0)
@@ -252,8 +258,6 @@ def train(
                     patience += 1
             if early_stop and patience > 7:
                 break
-            if auprc:
-                print("AUPRC: "+str(AUPRC(pts)))
             validendtime = time.time()
             if validtime:
                 print("valid time:  "+str(validendtime-validstarttime))

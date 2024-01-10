@@ -6,6 +6,26 @@ from torch.nn import functional as F
 import pdb
 from torch.autograd import Variable
 
+class Average(torch.nn.Module):
+    """Average embeddings module."""
+    def __init__(self): 
+        """Initialize Average Module.
+
+        Args:
+            indim (int): Input dimension
+        """
+        super(Average, self).__init__()
+    
+    def forward(self, modalities):
+        """
+        Forward Pass of averaging operation.
+        
+        :param modalities: An iterable of modalities to combine
+        """
+        flattened = []
+        for modality in modalities:
+            flattened.append(torch.flatten(modality, start_dim=1))
+        return torch.mean(torch.stack(flattened, dim=2), dim=2)
 
 
 class Concat(nn.Module):

@@ -1,6 +1,7 @@
 """Code to eventually load kinetics data."""
-
 import os
+import shutil
+from pathlib import Path
 import torch
 
 from torchvision.datasets import Kinetics400
@@ -60,35 +61,41 @@ def getkinetics(datafolder, tempfolder, categorylist, frames_per_instance, reall
     return datas
 
 
-def getdata(datalist, splitsize=50):
-    """UNUSED: TODO
+
+def get_data(categories, base_dir, splitsize=50):
+    """
+    Process and organize files in given categories.
 
     Args:
-        datalist (_type_): _description_
-        splitsize (int, optional): _description_. Defaults to 50.
+        categories (list): List of category names.
+        base_dir (str): Base directory of data.
+        splitsize (int): Number of files to process in a batch. Defaults to 50.
     """
-    catacount = 0
-    trainhome = '/home/pliang/yiwei/kinetics/ActivityNet/Crawler/Kinetics/test_data/'
-    zemp_dir = trainhome+'zemp/'
-    if not os.path.exists(zemp_dir):
-        os.makedirs(zemp_dir)
-    for category in datalist:
-        files = os.listdir(trainhome+category)
-        for i in range((len(files)-1)//splitsize+1):
-            for j in range(0, splitsize):
-                if i*splitsize+j >= len(files):
-                    break
-                os.system('cp -r '+trainhome+category+'/' +
-                          files[i*splitsize+j]+' '+zemp_dir)
-                # os.system('mv '+trainhome+category+'/'+files[i*splitsize+j]+' '+trainhome+'zemp/')
-            # a=getkinetics(trainhome,trainhome,['zemp'],150,catacount,2,(224,224))
-            a = getkinetics(trainhome, '/home/pliang/yiwei/kinetics/ActivityNet/Crawler/Kinetics/temp', [
-                            'zemp'], 150, catacount, 2, (224, 224))
-            exit()
-            torch.save(a, '/data/yiwei/kinetics_small/test/' +
-                       category+str(i)+'.pt')
-            os.system('mv '+trainhome+'zemp/* '+trainhome+category)
-        catacount += 1
 
+    for category in categories:
+        category_dir = Path(base_dir) / category
+        temp_dir = Path(base_dir) / 'temp'
 
-getdata(['archery', 'breakdancing', 'crying', 'dining', 'singing'])
+        if not category_dir.exists():
+            print(f"Category directory {category_dir} not found.")
+            continue
+
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        files = list(category_dir.glob('*'))
+        for i in range(0, len(files), splitsize):
+            batch_files = files[i:i + splitsize]
+            for file in batch_files:
+                shutil.copy(file, temp_dir)
+
+            # Process the batch (Replace with actual processing code)
+            # process_batch(batch_files, temp_dir)
+
+            for file in batch_files:
+                shutil.move(temp_dir / file.name, category_dir)
+
+        # Additional processing if needed
+        # post_process_category(category_dir)
+
+# Example usage
+get_data(['archery', 'breakdancing', 'crying', 'dining', 'singing'], '/home/pliang/yiwei/kinetics/ActivityNet/Crawler/Kinetics/test_data')
