@@ -6,3 +6,4 @@ scikit-learn
 matplotlib
 h5py
 wandb
+pytorch-lightning

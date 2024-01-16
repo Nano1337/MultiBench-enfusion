@@ -12,7 +12,7 @@ import wandb
 
 softmax = nn.Softmax()
 
-
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 class MMDL(nn.Module):
     """Implements MMDL classifier."""
     
@@ -69,19 +69,15 @@ class MMDL(nn.Module):
 
 def deal_with_objective(objectives, preds, truth, args):
     """Alter inputs depending on objective function, to deal with different objective arguments."""
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    if type(objectives[0]) == nn.CrossEntropyLoss:
-        out = []
-        for i, pred in enumerate(preds): 
-            pred = torch.argmax(pred, dim=1).float()
-            out.append(objectives[i](pred, truth.float().to(device)))
+    if isinstance(objectives[0], nn.CrossEntropyLoss):
+        # move truth to cuda
+        truth = truth.to(device)
+        out = [objective(pred, truth) for objective, pred in zip(objectives, preds)]
         return sum(out) / len(out)
-    elif type(objectives[0]) == nn.MSELoss or type(objectives[0]) == nn.modules.loss.BCEWithLogitsLoss or type(objectives[0]) == nn.L1Loss:
+    elif isinstance(objectives[0], (nn.MSELoss, nn.modules.loss.BCEWithLogitsLoss, nn.L1Loss)):
         raise NotImplementedError
     else:
         raise NotImplementedError
-
-
 
 class EnsembleModel(nn.Module): 
     def __init__(self, encoders, heads): 
@@ -131,6 +127,7 @@ def train(
         for m in additional_optimizing_modules:
             additional_params.extend(
                 [p for p in m.parameters() if p.requires_grad])
+
         op = optimtype([p for p in model.parameters() if p.requires_grad] +
                        additional_params, lr=lr, weight_decay=weight_decay)
         bestvalloss = 10000
@@ -262,6 +259,11 @@ def train(
             if validtime:
                 print("valid time:  "+str(validendtime-validstarttime))
                 print("Valid total: "+str(totals))
+    
+    # track gradients for all model parameters
+    for param in model.parameters(): 
+        param.requires_grad = True
+
     if track_complexity:
         all_in_one_train(_trainprocess, [model]+additional_optimizing_modules)
     else:

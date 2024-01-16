@@ -9,9 +9,8 @@ from eval_scripts.robustness import relative_robustness, effective_robustness, s
 from tqdm import tqdm
 import wandb 
 #import pdb
-
 softmax = nn.Softmax()
-
+import torch.nn.functional as F
 
 class MMDL(nn.Module):
     """Implements MMDL classifier."""
@@ -67,24 +66,56 @@ class MMDL(nn.Module):
         return self.head(out)
 
 
-def deal_with_objective(objective, pred, truth, args):
+def deal_with_objective(model, param_weights, objective, input, truth, args, training=True):
     """Alter inputs depending on objective function, to deal with different objective arguments."""
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if type(objective) == nn.CrossEntropyLoss:
-        if len(truth.size()) == len(pred.size()):
-            truth1 = truth.squeeze(len(pred.size())-1)
-        else:
-            truth1 = truth
-        return objective(pred, truth1.long().to(device))
+        truth = truth.long().to(device)
+        
+        pred = model(input)
+        loss = objective(pred, truth)
+        if training:
+            grads_per_sample = [torch.autograd.grad(l, param_weights, create_graph=True) for l in loss]
+        else: 
+            grads_per_sample = []
+        return grads_per_sample, pred, torch.mean(loss)
+    
     elif type(objective) == nn.MSELoss or type(objective) == nn.modules.loss.BCEWithLogitsLoss or type(objective) == nn.L1Loss:
-        return objective(pred, truth.float().to(device))
+        raise NotImplementedError
     else:
-        return objective(pred, truth, args)
+        raise NotImplementedError
+
+def temperature_scaled_softmax(logits, temperature=1.0):
+    logits = logits / temperature
+    return F.softmax(logits, dim=0)
+
+def calc_SI(grad, temp=1.0): 
+    """_summary_
+
+    Args:
+        grad (torch.FloatTensor): gradient of classifier head
+
+    Returns:
+        torch.FloatTensor: weighted gradient of classifier head
+    """
+    
+    # calc SI for each gradient in batch
+    scores = torch.sum(grad**2, dim = list(range(1, grad.dim()))) # (B)
+    
+    # normalize
+    norm_scores = (scores - torch.mean(scores)) / torch.std(scores) # (B)
+    
+    # calc softmax as a weighting
+    softmax_scores = temperature_scaled_softmax(norm_scores, temperature=temp).unsqueeze(1).unsqueeze(2) # (B, 1, 1)
+    
+    # apply softmax weights to original grad
+    output = grad * softmax_scores
+    return output.mean(dim=0)
 
 def train(
         encoders, fusion, head, train_dataloader, valid_dataloader, total_epochs, additional_optimizing_modules=[], is_packed=False,
         early_stop=False, task="classification", optimtype=torch.optim.RMSprop, lr=0.001, weight_decay=0.0,
-        objective=nn.CrossEntropyLoss(), auprc=False, save='best.pt', validtime=False, objective_args_dict=None, input_to_float=True, clip_val=8,
+        objective=nn.CrossEntropyLoss(reduction='none'), auprc=False, save='best.pt', validtime=False, objective_args_dict=None, input_to_float=True, clip_val=8,
         track_complexity=True):
     """
     Handle running a simple supervised training loop.
@@ -111,7 +142,11 @@ def train(
     """
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = MMDL(encoders, fusion, head, has_padding=is_packed).to(device) 
-    
+    param_weights = []
+    for name, params in model.named_parameters(): 
+        if 'head' in name and 'weight' in name: 
+            param_weights.append(params)
+            
     def _trainprocess():
         additional_params = []
         for m in additional_optimizing_modules:
@@ -129,7 +164,7 @@ def train(
                 return inp.float()
             else:
                 return inp
-
+        
         for epoch in range(total_epochs):
             totalloss = 0.0
             totals = 0
@@ -139,31 +174,33 @@ def train(
             for j in train_dataloader:
                 
                 op.zero_grad()
-                if is_packed:
-                    with torch.backends.cudnn.flags(enabled=False):
-                        model.train()
-                        out = model([[_processinput(i).to(device)
-                                    for i in j[0]], j[1]])
-
-                else:
-                    model.train()
-                    out = model([_processinput(i).to(device)
-                                for i in j[:-1]])
-                if not (objective_args_dict is None):
-                    objective_args_dict['reps'] = model.reps
-                    objective_args_dict['fused'] = model.fuseout
-                    objective_args_dict['inputs'] = j[:-1]
-                    objective_args_dict['training'] = True
-                    objective_args_dict['model'] = model
-                loss = deal_with_objective(
-                    objective, out, j[-1], objective_args_dict)
+                model.train()
+                input = [_processinput(i).to(device)
+                            for i in j[:-1]]
+                
+                grads, out, loss = deal_with_objective(model, param_weights, objective, input, j[-1], objective_args_dict)
+                
+                loss.backward()
+                
+                grad_output = []
+                for i in range(len(param_weights)): 
+                    grad = torch.stack([t[i] for t in grads])
+                    grad_output.append(calc_SI(grad, temp=1.0 if epoch<total_epochs//2 else -1.0)) # apply weighting to classifier gradients
+                
+                # Apply the weighted averaged gradients to the model parameters
+                i = 0
+                for name, param in model.named_parameters(): 
+                    if "head" in name and "weight" in name: 
+                        param.grad = grad_output[i]
+                        i += 1    
+                
                 if task == "classification":
                         pred.append(torch.argmax(out, 1))
                 true.append(j[-1])
 
                 totalloss += loss * len(j[-1])
                 totals += len(j[-1])
-                loss.backward()
+                # loss.backward() # replace with custom weight gradient update method
                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val)
                 op.step()
             
@@ -185,20 +222,11 @@ def train(
                 true = []
                 pts = []
                 for j in valid_dataloader:
-                    if is_packed:
-                        out = model([[_processinput(i).to(device)
-                                    for i in j[0]], j[1]])
-                    else:
-                        out = model([_processinput(i).to(device)
-                                    for i in j[:-1]])
 
-                    if not (objective_args_dict is None):
-                        objective_args_dict['reps'] = model.reps
-                        objective_args_dict['fused'] = model.fuseout
-                        objective_args_dict['inputs'] = j[:-1]
-                        objective_args_dict['training'] = False
-                    loss = deal_with_objective(
-                        objective, out, j[-1], objective_args_dict)
+                    input = [_processinput(i).to(device)
+                                for i in j[:-1]]
+
+                    _, out, loss = deal_with_objective(model, param_weights, objective, input, j[-1], objective_args_dict, training=False)
                     totalloss += loss*len(j[-1])
                     
                     if task == "classification":
